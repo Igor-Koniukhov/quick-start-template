@@ -1,0 +1,102 @@
+services:
+  nginx:
+    container_name: nginx
+    image: nginx:alpine
+    ports:
+      - ${NGINX_EXPOSE_PORT}:${NGINX_PORT}
+    restart: always
+    volumes:
+      - ./config/development/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./config/development/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+
+  frontend:
+    container_name: frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - ${FRONTEND_EXPOSE_PORT}:${FRONTEND_PORT}
+    restart: always
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+      - .env:/app/.env
+
+  postgres:
+    container_name: postgres
+    build:
+      context: ./postgres-healthcheck
+      dockerfile: Dockerfile.dev
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - ${DB_EXPOSE_PORT}:${DB_PORT}
+
+  migrator:
+    container_name: migrator
+    build:
+      context: ./migrator
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./migrator:/app
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  backend:
+    container_name: backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    ports:
+      - ${BACKEND_EXPOSE_PORT}:${BACKEND_PORT}
+    restart: always
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'curl',
+          '-f',
+          'http://backend:${BACKEND_PORT}/api/v1/health',
+        ]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+
+
+  rabbitmq:
+    container_name: rabbitmq
+    image: rabbitmq:3.11.15-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD}
+    ports:
+      - ${RABBITMQ_EXPOSE_PORT}:${RABBITMQ_PORT}
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
