@@ -1,0 +1,138 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  POSTGRES_DB: best_chat_db
+  POSTGRES_USER: igor
+  POSTGRES_PASSWORD: password
+
+jobs:
+  setup-frontend:
+    runs-on: ubuntu-latest
+    container: node:alpine
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install SSH Client
+        run: |
+          apk update
+          apk add openssh-client
+      - name: Install dependencies
+        run: |
+          cd ./frontend
+          npm config set registry ${CI_NPM_REGISTRY}
+          npm install
+      - name: Lint
+        run: |
+          cd ./frontend
+          npm run lint
+      - name: Test
+        run: |
+          cd ./frontend
+          npm run test:ci
+
+  setup-backend:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    services:
+      postgres:
+        image: postgres:12.2-alpine
+        env:
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install SSH Client
+        run: |
+          apk update
+          apk add openssh-client
+      - name: Lint
+        uses: golangci/golangci-lint-action@v2
+        with:
+          version: v1.51.0
+          working-directory: ./backend
+      - name: Migration
+        env:
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_HOST: localhost
+        run: |
+          cd ./backend
+          go get -u github.com/pressly/goose/cmd/goose
+          goose postgres "user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=${POSTGRES_DB} host=${POSTGRES_HOST} sslmode=disable" up
+
+      - name: Test
+        run: |
+          cd ./backend
+          go test -v ./...
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    needs: [ setup-frontend, setup-backend ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install SSH Client
+        run: |
+          apk update
+          apk add openssh-client
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push Docker images
+        run: |
+          cd ./backend
+          docker build -t your-dockerhub-username/backend:latest .
+          docker push your-dockerhub-username/backend:latest
+
+  deploy-to-stage:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    needs: [ build-and-push ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install SSH Client
+        run: |
+          apk update
+          apk add openssh-client
+      - name: Setup SSH Keys and Known Hosts
+        env:
+          STAGING_PRIVATE_KEY: ${{ secrets.STAGING_PRIVATE_KEY }}
+          STAGING_IP: ${{ secrets.STAGING_IP }}
+        run: |
+          apk add --update openssh-client
+          mkdir -p ~/.ssh
+          echo "$STAGING_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+          ssh-keyscan -p 221 -H $STAGING_IP >> ~/.ssh/known_hosts
+
+      - name: Deploy to Staging
+        env:
+          CI_REGISTRY_USER: ${{ secrets.DOCKER_USERNAME }}
+          CI_REGISTRY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          STAGING_IP: ${{ secrets.STAGING_IP }}
+          PROJECT_PATH: ${{ secrets.PROJECT_PATH }}
+          STAGING_ENV: ${{ secrets.STAGING_ENV }}
+        run: |
+          ssh dev@${STAGING_IP} -p 221 "mkdir -p ${PROJECT_PATH}"
+          scp -P 221 ${STAGING_ENV} dev@${STAGING_IP}:${PROJECT_PATH}/.env
+          scp -P 221 -r ./config/staging dev@${STAGING_IP}:${PROJECT_PATH}/config
+          scp -P 221 ./compose.stage.yml dev@${STAGING_IP}:${PROJECT_PATH}/compose.stage.yml
+          ssh dev@$STAGING_IP -p 221 "
+            docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY};
+            docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/postgres:staging;
+            docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/migrator:staging;
+            docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/backend:staging;
+            docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/frontend:staging;
+            docker compose -f ${PROJECT_PATH}/compose.stage.yml up -d"
+  
