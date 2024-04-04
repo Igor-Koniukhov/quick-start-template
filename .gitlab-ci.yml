@@ -1,0 +1,193 @@
+image: docker:stable
+
+variables:
+  DOCKER_DRIVER: overlay2
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  DOCKER_TLS_CERTDIR: ""
+  POSTGRES_DB: best_chat_db
+  POSTGRES_USER: igor
+  POSTGRES_PASSWORD: password
+  POSTGRES_HOST_AUTH_METHOD: trust
+
+services:
+  - docker:dind
+  - postgres:12.2-alpine
+
+stages:
+  - backend
+  - frontend
+  - build
+  - deploy
+
+npm:
+  image: node:alpine
+  stage: frontend
+  script:
+    - cd ./frontend
+    - npm config set registry ${CI_NPM_REGISTRY}
+    - npm install
+  cache:
+    paths:
+      - ./frontend/node_modules/
+  artifacts:
+    expire_in: 1 days
+    when: on_success
+    paths:
+      - ./frontend/node_modules/
+  when: manual
+
+frontend-lint:
+  image: node:alpine
+  stage: frontend
+  needs:
+    - job: npm
+      artifacts: true
+  script:
+    - cd ./frontend
+    - npm run lint
+  when: manual
+
+frontend-test:
+  image: node:alpine
+  stage: frontend
+  needs:
+    - job: npm
+      artifacts: true
+  script:
+    - cd ./frontend
+    - npm run test:ci
+  when: manual
+
+backend-lint:
+  image: golangci/golangci-lint:v1.51.0
+  stage: backend
+  before_script:
+    - cd ./backend
+  script:
+    - golangci-lint run
+  when: manual
+
+migration:
+  image: golang:1.20.1-alpine3.17
+  stage: backend
+  tags:
+    - dind
+    - docker
+  before_script:
+    - apk add --no-cache --update git build-base openssh-client curl tar
+    - go install github.com/pressly/goose/cmd/goose@latest
+  script:
+    - goose -dir "./migrator/migrations" postgres "user=igor password=password host=postgres port=5432 dbname=best_chat_db sslmode=disable" up
+  when: manual
+
+backend-test:
+  image: golang:1.20.1-alpine3.17
+  stage: backend
+  tags:
+    - dind
+    - docker
+  before_script:
+    - cp .env.gitlab-ci ./backend/.env.testing
+    - cd ./backend
+    - apk add --no-cache --update git build-base openssh-client curl tar
+  script:
+    - go get -v ./...
+    - go test -v ./...
+  when: manual
+
+postgres-build:
+  tags:
+    - dind
+    - docker
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd ./postgres-healthcheck
+    - docker build
+      --build-arg WEB_PRIVATE_KEY="$WEB_PRIVATE_KEY"
+      --build-arg GIT_DOMAIN=$CI_SERVER_HOST
+      -t $CI_REGISTRY_IMAGE/postgres:staging 
+      -f Dockerfile.stage .
+    - docker push $CI_REGISTRY_IMAGE/postgres:staging
+  when: manual
+
+migrator-build:
+  tags:
+    - dind
+    - docker
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd ./migrator 
+    - docker build
+      --build-arg WEB_PRIVATE_KEY="$WEB_PRIVATE_KEY"
+      --build-arg GIT_DOMAIN=$CI_SERVER_HOST
+      -t $CI_REGISTRY_IMAGE/migrator:staging 
+      -f Dockerfile.stage .
+    - docker push $CI_REGISTRY_IMAGE/migrator:staging
+  when: manual
+
+backend-build:
+  tags:
+    - dind
+    - docker
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd ./backend
+    - docker build 
+      --build-arg WEB_PRIVATE_KEY="$WEB_PRIVATE_KEY" 
+      --build-arg GIT_DOMAIN=$CI_SERVER_HOST 
+      -t $CI_REGISTRY_IMAGE/backend:staging 
+      -f Dockerfile.stage .
+    - docker push $CI_REGISTRY_IMAGE/backend:staging
+  when: manual
+
+frontend-build:
+  tags:
+    - dind
+    - docker
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd ./frontend
+    - docker build
+      --build-arg WEB_PRIVATE_KEY="$WEB_PRIVATE_KEY"
+      --build-arg GIT_DOMAIN=$CI_SERVER_HOST
+      -t $CI_REGISTRY_IMAGE/frontend:staging 
+      -f Dockerfile.stage .
+    - docker push $CI_REGISTRY_IMAGE/frontend:staging
+  when: manual
+
+deploy-to-stage:
+  environment:
+    name: staging
+  tags:
+    - dind
+    - docker
+  stage: deploy
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - apk add --update openssh-client bash
+    - mkdir -p ~/.ssh
+    - echo "$STAGING_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - eval "$(ssh-agent -s)"
+    - ssh-add ~/.ssh/id_rsa
+    - ssh-keyscan -p 221 -H $STAGING_IP >> ~/.ssh/known_hosts
+  script:
+    - ssh dev@${STAGING_IP} -p 221 "mkdir -p ${PROJECT_PATH}"
+    - scp -P 221 -r ${STAGING_ENV} dev@${STAGING_IP}:${PROJECT_PATH}/.env
+    - scp -P 221 -r ./config/staging dev@${STAGING_IP}:${PROJECT_PATH}/config
+    - scp -P 221 -r ./compose.stage.yml dev@${STAGING_IP}:${PROJECT_PATH}/compose.stage.yml
+    - ssh dev@$STAGING_IP -p 221 "docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY};
+      docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/postgres:staging;
+      docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/migrator:staging;
+      docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/backend:staging;
+      docker pull ${CI_REGISTRY}/${CI_PROJECT_PATH}/frontend:staging;
+      docker compose -f ${PROJECT_PATH}/compose.stage.yml up -d"
+  when: manual
