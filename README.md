@@ -29,3 +29,4 @@ mkdir -p .github/workflows
 touch .github/workflows/ci-cd-pipeline.yml
 ```
 #### For Gitlab .gitlab-ci.yml should be located in the root
+
